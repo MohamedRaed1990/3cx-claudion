@@ -25,7 +25,7 @@ def get_context(context):
 
         # 2. تجهيز القاموس
         params = {
-            "ticket_type": "Phone Call",
+            "custom_channel": "Phone Call",
             "custom_phone_number": phone_clean,
             "custom_agency_phone": phone_clean,
             "subject": f"Incoming Call: {phone_clean}",
