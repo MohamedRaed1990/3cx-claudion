@@ -312,7 +312,9 @@ def verify_queue_status(extension, expected, retries=15, delay=2):
                 target = {True: "Logged In", False: "Logged Out"}.get(qs)
                 current = frappe.db.get_value("CX3 Extension Status", extension, "queue_status")
                 if current != target:
-                    frappe.db.set_value("CX3 Extension Status", extension, {"queue_status": target})
+                    doc = frappe.get_doc("CX3 Extension Status", extension)
+                    doc.queue_status = target
+                    doc.save(ignore_permissions=True)
             return
         time.sleep(delay)
 
