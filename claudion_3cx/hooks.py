@@ -130,6 +130,12 @@ app_license = "mit"
 # 	}
 # }
 
+doc_events = {
+    "CX3 Extension Status": {
+        "on_update": "claudion_3cx.claudion_3cx.status_sync.on_extension_status_update"
+    }
+}
+
 # Scheduled Tasks
 # ---------------
 
@@ -150,7 +156,16 @@ app_license = "mit"
 # 		"claudion_3cx.tasks.monthly"
 # 	],
 # }
-
+scheduler_events = {
+    "cron": {
+        "* * * * *": [
+            "claudion_3cx.claudion_3cx.status_sync.sync_extension_status"
+        ],
+        "0 0 * * *": [
+            "claudion_3cx.claudion_3cx.status_sync.set_all_off_duty"
+        ]
+    }
+}
 # Testing
 # -------
 
