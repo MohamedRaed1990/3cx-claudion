@@ -2,15 +2,66 @@ import frappe
 from frappe import _
 from frappe.utils import add_to_date, now_datetime, get_url
 
-EXTENSION_AGENT_MAP = {
-    "125": "m.raed@cx3.me",
-    "127": "ahmed_mansour23@hotmail.com",
-}
+SUPERVISOR_ROLE = "3CX Supervisor"
 
 INCOMING_CALLTYPES = {"inbound", "missed"}
 OUTGOING_CALLTYPES = {"outbound", "notanswered"}
 NO_ANSWER_CALLTYPES = {"missed", "notanswered"}
 
+
+# ===================== Helpers =====================
+
+def get_agent_user(extension):
+    """يجلب مستخدم Frappe بناءً على رقم الإكستنشن في 3CX (بدون خريطة يدوية)."""
+    if not extension:
+        return None
+    ext = str(extension).strip()
+    if not ext:
+        return None
+    return frappe.db.get_value(
+        "User",
+        {"custom_3cx_extension": ext, "enabled": 1},
+        ["name", "full_name", "custom_3cx_queue"],
+        as_dict=True,
+    )
+
+
+def is_supervisor(user=None):
+    user = user or frappe.session.user
+    if user == "Administrator":
+        return True
+    return SUPERVISOR_ROLE in frappe.get_roles(user)
+
+
+def setup_custom_fields():
+    """Run once: bench execute claudion_3cx.claudion_3cx.calls.setup_custom_fields"""
+    from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+    if not frappe.db.exists("Role", SUPERVISOR_ROLE):
+        frappe.get_doc({
+            "doctype": "Role",
+            "role_name": SUPERVISOR_ROLE,
+            "desk_access": 1,
+        }).insert(ignore_permissions=True)
+
+    create_custom_fields({
+        "User": [
+            {"fieldname": "custom_3cx_extension", "label": "3CX Extension",
+             "fieldtype": "Data", "insert_after": "mobile_no"},
+            {"fieldname": "custom_3cx_queue", "label": "3CX Queue",
+             "fieldtype": "Data", "insert_after": "custom_3cx_extension"},
+        ],
+        "Call Log": [
+            {"fieldname": "custom_3cx_queue", "label": "3CX Queue",
+             "fieldtype": "Data", "insert_after": "medium"},
+        ],
+    }, update=True)
+
+    frappe.db.commit()
+    return "Custom fields and role created successfully."
+
+
+# ===================== 3CX Webhooks =====================
 
 @frappe.whitelist(allow_guest=True)
 def cx3_ring(phone=None, agent=None, **kwargs):
@@ -25,11 +76,11 @@ def cx3_ring(phone=None, agent=None, **kwargs):
         frappe.cache().delete_value(f"cx3_subject:{phone}")
         frappe.cache().set_value(f"cx3_active:{phone}", "1", expires_in_sec=3600)
 
-    agent_email = EXTENSION_AGENT_MAP.get(str(agent).strip()) if agent else None
+    agent_user = get_agent_user(agent)
 
-    if agent_email and phone:
+    if agent_user and phone:
         frappe.publish_realtime("exotel_call", {
-            "AgentEmail": agent_email,
+            "AgentEmail": agent_user.name,
             "CallFrom": phone,
             "From": phone,
             "EventType": "Dial",
@@ -55,23 +106,29 @@ def cx3_ring(phone=None, agent=None, **kwargs):
 @frappe.whitelist(allow_guest=True)
 def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None,
                     agent=None, agent_name=None, call_id=None, recording_url=None,
-                    rec_file=None, rec_path=None, **kwargs):
+                    rec_file=None, rec_path=None, queue=None, **kwargs):
     """WebHook triggered by 3CX on Call Completion."""
     frappe.log_error(
         title="CX3 LOG DEBUG - FULL",
-        message=f"phone={phone}, agent={agent}, calltype={calltype}, duration={duration}, recording_url={recording_url}, rec_file={rec_file}, rec_path={rec_path}, kwargs={kwargs}"
+        message=f"phone={phone}, agent={agent}, calltype={calltype}, duration={duration}, "
+                f"queue={queue}, recording_url={recording_url}, rec_file={rec_file}, "
+                f"rec_path={rec_path}, kwargs={kwargs}"
     )
+
     # 1. Unique Call ID
     cid = call_id or kwargs.get("callid") or kwargs.get("CallId") or kwargs.get("call_id")
     final_call_id = str(cid).strip() if cid and str(cid).strip() else frappe.generate_hash(length=10)
 
-    # 2. Tracked Extension Check
+    # 2. Agent Lookup (Queue Member) — ديناميكي من قاعدة البيانات
     current_agent = str(agent).strip() if agent else ""
-    if current_agent not in EXTENSION_AGENT_MAP:
+    agent_user = get_agent_user(current_agent)
+    if not agent_user:
         return {
             "status": "ignored",
-            "message": f"Call ignored. Extension {current_agent} is not tracked."
+            "message": f"Call ignored. Extension {current_agent} is not assigned to any enabled Frappe user.",
         }
+
+    agent_email = agent_user.name
 
     # 3. Short Deduplication Lock
     dedup_key = f"cx3_reportcall_lock:{phone}:{duration}"
@@ -93,20 +150,17 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
     except Exception:
         total_seconds = 0
 
-    # 5. Agent Email & UI Realtime Popup Broadcast
-    agent_email = EXTENSION_AGENT_MAP.get(current_agent)
-    if agent_email:
-        frappe.publish_realtime("exotel_call", {
-            "AgentEmail": agent_email,
-            "Direction": "incoming",
-            "CallType": "completed",
-            "DialCallStatus": "completed",
-            "Legs[0][OnCallDuration]": total_seconds,
-            "DialCallDuration": total_seconds,
-        })
+    # 5. UI Realtime Popup Broadcast
+    frappe.publish_realtime("exotel_call", {
+        "AgentEmail": agent_email,
+        "Direction": "incoming",
+        "CallType": "completed",
+        "DialCallStatus": "completed",
+        "Legs[0][OnCallDuration]": total_seconds,
+        "DialCallDuration": total_seconds,
+    })
 
-    # 6. Recording Link Setup 
-
+    # 6. Recording Link Setup
     rec_file = str(rec_file or "").strip()
     rec_path = str(rec_path or "").strip()
 
@@ -115,7 +169,13 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
         recording_link = str(recording_url).strip()
     start_time = add_to_date(now_datetime(), seconds=-total_seconds)
     end_time = now_datetime()
-    agent_display = f"{agent_name} ({agent})" if agent and agent_name else (agent if agent else "Main Telecom")
+
+    if agent_name and current_agent:
+        agent_display = f"{agent_name} ({current_agent})"
+    elif agent_user.full_name:
+        agent_display = f"{agent_user.full_name} ({current_agent})"
+    else:
+        agent_display = current_agent or "Main Telecom"
 
     # 7. Lookups (Customer, Contact, Employee)
     customer_name_val = None
@@ -127,10 +187,12 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
         contact_name_val = frappe.db.get_value("Contact", {"mobile_no": ["like", f"%{phone}%"]}, "name") or \
                            frappe.db.get_value("Contact", {"phone": ["like", f"%{phone}%"]}, "name")
 
-    if agent_email:
-        employee_name_val = frappe.db.get_value("Employee", {"user_id": agent_email}, "name")
+    employee_name_val = frappe.db.get_value("Employee", {"user_id": agent_email}, "name")
 
-    # 8. Direction & Status Calculation
+    # 8. Queue Resolution: أولاً من 3CX (لو مُمرَّر)، وإلا من إعدادات اليوزر
+    queue_name = str(queue).strip() if queue and str(queue).strip() else (agent_user.custom_3cx_queue or None)
+
+    # 9. Direction & Status Calculation
     ctype = str(calltype).lower().strip() if calltype else ""
     if ctype in INCOMING_CALLTYPES:
         actual_type = "Incoming"
@@ -147,6 +209,9 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
 
     call_status = "No Answer" if ctype in NO_ANSWER_CALLTYPES else ("Completed" if total_seconds > 0 else "No Answer")
     summary_text = f"{actual_type} call {'from ' + from_val if actual_type == 'Incoming' else 'to ' + to_val}. Duration: {total_seconds}s."
+    if queue_name:
+        summary_text += f" Queue: {queue_name}."
+
     # Cache cleanup & Pending Notes
     pending_subject = frappe.cache().get_value(f"cx3_subject:{phone}") or ""
     pending_note = frappe.cache().get_value(f"cx3_note:{phone}")
@@ -159,7 +224,7 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
 
     frappe.cache().delete_value(f"cx3_active:{phone}")
 
-    # 9. Populate Call Log Document
+    # 10. Populate Call Log Document
     doc_payload = {
         "doctype": "Call Log",
         "id": final_call_id,
@@ -177,6 +242,7 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
         "employee_user_id": agent_email,
         "call_received_by": employee_name_val,
         "customer": customer_name_val,
+        "custom_3cx_queue": queue_name,
     }
 
     if pending_subject:
@@ -203,6 +269,7 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
 
     return {"status": "success", "id": call_log.name}
 
+
 @frappe.whitelist(allow_guest=True)
 def get_recording(call_log=None):
     """Redirects to the full 3CX recording link stored in custom_recording_url."""
@@ -218,6 +285,7 @@ def get_recording(call_log=None):
 
     frappe.local.response.http_status_code = 404
     return {"status": "error", "message": "Recording not found"}
+
 
 @frappe.whitelist(allow_guest=True)
 def cx3_save_note(phone=None, note=None, subject=None):
@@ -303,3 +371,37 @@ def create_contact_with_phone():
             'status': 'error',
             'message': f"An error occurred: {str(e)}"
         }
+
+
+# ===================== Permissions =====================
+
+def has_call_log_permission(doc=None, ptype=None, user=None, **kwargs):
+    """يرى المستخدم العادي مكالماته فقط، والمشرف يرى الكل."""
+    user = user or frappe.session.user
+    if is_supervisor(user):
+        return True
+
+    # مستوى الـ Doctype (فتح الصفحة): مسموح، والصفوف تُفلتر في list view
+    if not doc:
+        return True
+
+    # مكالمة مستخدم نفسه
+    if getattr(doc, "employee_user_id", None) == user:
+        return True
+
+    # عبر ربط الـ Employee المرتبط باليوزر
+    for link in doc.get("links") or []:
+        if link.link_doctype == "Employee":
+            emp_user = frappe.db.get_value("Employee", link.link_name, "user_id")
+            if emp_user == user:
+                return True
+
+    return False
+
+
+def call_log_query_conditions(user=None):
+    """فلترة قائمة Call Log حسب الصلاحية."""
+    user = user or frappe.session.user
+    if is_supervisor(user):
+        return ""
+    return f"(`tabCall Log`.employee_user_id = {frappe.db.escape(user)})"

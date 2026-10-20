@@ -109,7 +109,13 @@ app_license = "mit"
 # has_permission = {
 # 	"Event": "frappe.desk.doctype.event.event.has_permission",
 # }
+permission_query_conditions = {
+    "Call Log": "claudion_3cx.claudion_3cx.calls.call_log_query_conditions",
+}
 
+has_permission = {
+    "Call Log": "claudion_3cx.claudion_3cx.calls.has_call_log_permission",
+}
 # DocType Class
 # ---------------
 # Override standard doctype classes
