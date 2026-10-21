@@ -227,7 +227,7 @@ def on_extension_status_update(doc, method=None):
     if not profile_changed and not queue_changed:
         return
 
-    now = now_datetime()
+    now = doc.flags.get("status_time") or now_datetime()
     _auto_queue_sync(doc, profile_changed, old_profile)
 
     # 1. سجل الحالة الشخصية (كما كان)
@@ -349,8 +349,18 @@ def _roll_queue_log(doc, now):
 OFF_DUTY_RAW = {"Custom 2", "Offline Work"}
 TARGET_RAW = "Custom 2"
 
+def _apply_off_duty_locally(number, cutoff, queue_logged_out):
+    if not frappe.db.exists("CX3 Extension Status", number):
+        return
+    doc = frappe.get_doc("CX3 Extension Status", number)
+    doc.current_profile = "Off Duty"
+    if queue_logged_out and doc.queue_status is not None:
+        doc.queue_status = "Logged Out"
+    doc.flags.status_time = cutoff   # يُستخدم كوقت البداية في السجلات
+    doc.save(ignore_permissions=True)
 
 def set_all_off_duty(dry_run=False):
+    cutoff = now_datetime().replace(hour=23, minute=59, second=59, microsecond=0)
     """12 ليلًا: كل الموظفين Off Duty وخارج الطابور. لا شيء يعيدهم تلقائيًا."""
     users = xapi_get(
         "/xapi/v1/Users",
@@ -384,6 +394,7 @@ def set_all_off_duty(dry_run=False):
 
         try:
             xapi_patch(f"/xapi/v1/Users({u['Id']})", payload)
+            _apply_off_duty_locally(number, cutoff, "QueueStatus" in payload)
             changed.append({number: payload})
         except Exception:
             failed.append(number)

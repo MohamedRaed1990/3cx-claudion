@@ -167,7 +167,7 @@ scheduler_events = {
         "* * * * *": [
             "claudion_3cx.claudion_3cx.status_sync.sync_extension_status"
         ],
-        "0 0 * * *": [
+        "57 23 * * *": [
             "claudion_3cx.claudion_3cx.status_sync.set_all_off_duty"
         ]
     }
