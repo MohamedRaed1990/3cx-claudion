@@ -115,28 +115,46 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
                 f"rec_path={rec_path}, kwargs={kwargs}"
     )
 
+    # 0. Call Type — نحتاجه مبكراً
+    ctype = str(calltype).lower().strip() if calltype else ""
+
     # 1. Unique Call ID
     cid = call_id or kwargs.get("callid") or kwargs.get("CallId") or kwargs.get("call_id")
     final_call_id = str(cid).strip() if cid and str(cid).strip() else frappe.generate_hash(length=10)
 
-    # 2. Agent Lookup (Queue Member) — ديناميكي من قاعدة البيانات
+    # 2. Queue من 3CX إن كانت ممرَّرة (غالباً فارغة في نسختك)
+    queue_name = str(queue).strip() if queue and str(queue).strip() else None
+
+    # 3. Agent Lookup (Queue Member) — ديناميكي من قاعدة البيانات
     current_agent = str(agent).strip() if agent else ""
     agent_user = get_agent_user(current_agent)
+    is_unassigned_incoming = False
+
     if not agent_user:
-        return {
-            "status": "ignored",
-            "message": f"Call ignored. Extension {current_agent} is not assigned to any enabled Frappe user.",
-        }
+        if ctype in INCOMING_CALLTYPES:
+            # وارد بلا موظف مطابق (طابور لم يرد أحد) → يُسجَّل دائماً
+            # 3CX ترسل رقم الطابور في [Agent] عندما لا يرد أحد
+            is_unassigned_incoming = True
+            agent_email = None
+            if not queue_name and current_agent:
+                queue_name = current_agent
+        else:
+            return {
+                "status": "ignored",
+                "message": f"Call ignored. Extension {current_agent} is not assigned to any enabled Frappe user.",
+            }
+    else:
+        agent_email = agent_user.name
+        if not queue_name:
+            queue_name = agent_user.custom_3cx_queue or None
 
-    agent_email = agent_user.name
-
-    # 3. Short Deduplication Lock
+    # 4. Short Deduplication Lock
     dedup_key = f"cx3_reportcall_lock:{phone}:{duration}"
     if frappe.cache().get_value(dedup_key):
         return {"status": "ignored", "message": "Duplicate ReportCall webhook ignored"}
     frappe.cache().set_value(dedup_key, "1", expires_in_sec=10)
 
-    # 4. Parse Duration
+    # 5. Parse Duration
     total_seconds = 0
     try:
         if duration and ":" in str(duration):
@@ -150,17 +168,18 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
     except Exception:
         total_seconds = 0
 
-    # 5. UI Realtime Popup Broadcast
-    frappe.publish_realtime("exotel_call", {
-        "AgentEmail": agent_email,
-        "Direction": "incoming",
-        "CallType": "completed",
-        "DialCallStatus": "completed",
-        "Legs[0][OnCallDuration]": total_seconds,
-        "DialCallDuration": total_seconds,
-    })
+    # 6. UI Realtime Popup (فقط عند وجود موظف)
+    if agent_email:
+        frappe.publish_realtime("exotel_call", {
+            "AgentEmail": agent_email,
+            "Direction": "incoming",
+            "CallType": "completed",
+            "DialCallStatus": "completed",
+            "Legs[0][OnCallDuration]": total_seconds,
+            "DialCallDuration": total_seconds,
+        })
 
-    # 6. Recording Link Setup
+    # 7. Recording Link Setup
     rec_file = str(rec_file or "").strip()
     rec_path = str(rec_path or "").strip()
 
@@ -170,14 +189,23 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
     start_time = add_to_date(now_datetime(), seconds=-total_seconds)
     end_time = now_datetime()
 
-    if agent_name and current_agent:
-        agent_display = f"{agent_name} ({current_agent})"
-    elif agent_user.full_name:
-        agent_display = f"{agent_user.full_name} ({current_agent})"
+    # اسم المعروض
+    if agent_user:
+        if agent_name and current_agent:
+            agent_display = f"{agent_name} ({current_agent})"
+        elif agent_user.full_name:
+            agent_display = f"{agent_user.full_name} ({current_agent})"
+        else:
+            agent_display = current_agent or "Main Telecom"
     else:
-        agent_display = current_agent or "Main Telecom"
+        if queue_name and queue_name != current_agent:
+            agent_display = queue_name
+        elif current_agent:
+            agent_display = f"Queue {current_agent}"
+        else:
+            agent_display = "Unknown Queue"
 
-    # 7. Lookups (Customer, Contact, Employee)
+    # 8. Lookups (Customer, Contact, Employee)
     customer_name_val = None
     contact_name_val = None
     employee_name_val = None
@@ -187,13 +215,10 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
         contact_name_val = frappe.db.get_value("Contact", {"mobile_no": ["like", f"%{phone}%"]}, "name") or \
                            frappe.db.get_value("Contact", {"phone": ["like", f"%{phone}%"]}, "name")
 
-    employee_name_val = frappe.db.get_value("Employee", {"user_id": agent_email}, "name")
-
-    # 8. Queue Resolution: أولاً من 3CX (لو مُمرَّر)، وإلا من إعدادات اليوزر
-    queue_name = str(queue).strip() if queue and str(queue).strip() else (agent_user.custom_3cx_queue or None)
+    if agent_email:
+        employee_name_val = frappe.db.get_value("Employee", {"user_id": agent_email}, "name")
 
     # 9. Direction & Status Calculation
-    ctype = str(calltype).lower().strip() if calltype else ""
     if ctype in INCOMING_CALLTYPES:
         actual_type = "Incoming"
         from_val = phone if phone else "Unknown"
@@ -207,7 +232,12 @@ def log_call_to_log(phone=None, duration=None, calltype=None, customer_name=None
         from_val = phone if actual_type == "Incoming" else agent_display
         to_val = agent_display if actual_type == "Incoming" else phone
 
-    call_status = "No Answer" if ctype in NO_ANSWER_CALLTYPES else ("Completed" if total_seconds > 0 else "No Answer")
+    if is_unassigned_incoming:
+        # طابور بلا إجابة: duration>0 هو وقت الرنين وليس وقت الرد
+        call_status = "No Answer"
+    else:
+        call_status = "No Answer" if ctype in NO_ANSWER_CALLTYPES else ("Completed" if total_seconds > 0 else "No Answer")
+
     summary_text = f"{actual_type} call {'from ' + from_val if actual_type == 'Incoming' else 'to ' + to_val}. Duration: {total_seconds}s."
     if queue_name:
         summary_text += f" Queue: {queue_name}."
@@ -376,7 +406,7 @@ def create_contact_with_phone():
 # ===================== Permissions =====================
 
 def has_call_log_permission(doc=None, ptype=None, user=None, **kwargs):
-    """يرى المستخدم العادي مكالماته فقط، والمشرف يرى الكل."""
+    """يرى المستخدم العادي مكالماته + المكالمات الفائتة على طابوره، والمشرف يرى الكل."""
     user = user or frappe.session.user
     if is_supervisor(user):
         return True
@@ -389,6 +419,12 @@ def has_call_log_permission(doc=None, ptype=None, user=None, **kwargs):
     if getattr(doc, "employee_user_id", None) == user:
         return True
 
+    # مكالمة فائتة على الطابور: تظهر لأعضاء نفس الطابور
+    if not getattr(doc, "employee_user_id", None):
+        user_queue = frappe.db.get_value("User", user, "custom_3cx_queue")
+        if user_queue and getattr(doc, "custom_3cx_queue", None) == user_queue:
+            return True
+
     # عبر ربط الـ Employee المرتبط باليوزر
     for link in doc.get("links") or []:
         if link.link_doctype == "Employee":
@@ -400,8 +436,17 @@ def has_call_log_permission(doc=None, ptype=None, user=None, **kwargs):
 
 
 def call_log_query_conditions(user=None):
-    """فلترة قائمة Call Log حسب الصلاحية."""
+    """فلترة قائمة Call Log:
+    - المشرف: الكل
+    - المستخدم العادي: مكالماته + المكالمات الفائتة (بلا موظف) على طابوره
+    """
     user = user or frappe.session.user
     if is_supervisor(user):
         return ""
-    return f"(`tabCall Log`.employee_user_id = {frappe.db.escape(user)})"
+
+    user_queue = frappe.db.get_value("User", user, "custom_3cx_queue")
+    cond = f"`tabCall Log`.employee_user_id = {frappe.db.escape(user)}"
+    if user_queue:
+        cond += (f" OR (`tabCall Log`.employee_user_id IS NULL"
+                 f" AND `tabCall Log`.custom_3cx_queue = {frappe.db.escape(user_queue)})")
+    return f"({cond})"
