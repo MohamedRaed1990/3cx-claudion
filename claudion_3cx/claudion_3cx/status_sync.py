@@ -272,8 +272,7 @@ def _auto_queue_sync(doc, profile_changed, old_profile):
     target = None
     if doc.current_profile == "Off Duty" and doc.queue_status == "Logged In":
         target = "LoggedOut"
-    elif old_profile == "Off Duty" and doc.current_profile == "Available" \
-            and doc.queue_status == "Logged Out":
+    elif doc.current_profile == "Available" and doc.queue_status == "Logged Out":
         target = "LoggedIn"
 
     if not target:
