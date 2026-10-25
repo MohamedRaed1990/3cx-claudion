@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import re
 import time
 import requests
@@ -14,55 +15,127 @@ CUSTOM_STATUS_LABELS = {
     "Offline Work": "Off Duty",
 }
 
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8,ar;q=0.7",
+})
 
-def get_access_token():
+
+def _get_base_url():
+    base_url = frappe.conf.get("cx3_3cx_web_base_url") or frappe.conf.get("cx3_xapi_base_url")
+    if not base_url:
+        raise Exception("cx3_3cx_web_base_url or cx3_xapi_base_url not set in site_config.json")
+    return base_url.rstrip("/")
+
+
+def _web_login():
+    base_url = _get_base_url()
+    username = frappe.conf.get("cx3_3cx_web_user")
+    password = frappe.conf.get("cx3_3cx_web_pass")
+
+    if not username or not password:
+        raise Exception("cx3_3cx_web_user and cx3_3cx_web_pass must be set in site_config.json")
+
+    _session.cookies.clear()
+
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": base_url,
+        "Referer": f"{base_url}/",
+        "ngsw-bypass": "bypass",
+        "cache-control": "no-store",
+        "pragma": "no-cache",
+    }
+
+    resp = _session.post(
+        f"{base_url}/webclient/api/Login/GetAccessToken",
+        json={"ReCaptchaResponse": None, "SecurityCode": "", "Username": str(username), "Password": str(password)},
+        headers=headers,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return _session
+
+
+def get_access_token(force_login=False):
     cached = frappe.cache().get_value(CACHE_KEY)
-    if cached:
+    if cached and not force_login:
         return cached
 
-    base_url = frappe.conf.get("cx3_xapi_base_url")
-    client_id = frappe.conf.get("cx3_client_id")
-    client_secret = frappe.conf.get("cx3_client_secret")
+    base_url = _get_base_url()
+    _web_login()
 
-    resp = requests.post(
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Accept": "application/json",
+        "Origin": base_url,
+        "Referer": f"{base_url}/",
+        "ngsw-bypass": "bypass",
+        "cache-control": "no-store",
+        "pragma": "no-cache",
+    }
+
+    resp = _session.post(
         f"{base_url}/connect/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-        timeout=10,
+        data={"client_id": "Webclient", "grant_type": "refresh_token"},
+        headers=headers,
+        timeout=20,
     )
+    if resp.status_code != 200:
+        _session.cookies.clear()
+        _web_login()
+        resp = _session.post(
+            f"{base_url}/connect/token",
+            data={"client_id": "Webclient", "grant_type": "refresh_token"},
+            headers=headers,
+            timeout=20,
+        )
     resp.raise_for_status()
     data = resp.json()
     token = data["access_token"]
 
-    expires_in = int(data.get("expires_in", 3600)) - 60
+    expires_in = int(data.get("expires_in", 3600)) - 90
     frappe.cache().set_value(CACHE_KEY, token, expires_in_sec=max(expires_in, 60))
     return token
 
 
 def xapi_get(path, params=None):
-    base_url = frappe.conf.get("cx3_xapi_base_url")
+    base_url = _get_base_url()
     for attempt in (1, 2):
-        headers = {"Authorization": f"Bearer {get_access_token()}"}
-        resp = requests.get(f"{base_url}{path}", headers=headers, params=params, timeout=15)
-        if resp.status_code == 401 and attempt == 1:
-            frappe.cache().delete_value(CACHE_KEY)
-            continue
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            headers = {"Authorization": f"Bearer {get_access_token(force_login=(attempt == 2))}"}
+            resp = _session.get(f"{base_url}{path}", headers=headers, params=params, timeout=20)
+            if resp.status_code == 401 and attempt == 1:
+                frappe.cache().delete_value(CACHE_KEY)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401 and attempt == 1:
+                frappe.cache().delete_value(CACHE_KEY)
+                continue
+            raise
+
 
 def xapi_patch(path, payload):
-    base_url = frappe.conf.get("cx3_xapi_base_url")
+    base_url = _get_base_url()
     for attempt in (1, 2):
-        headers = {"Authorization": f"Bearer {get_access_token()}"}
-        resp = requests.patch(f"{base_url}{path}", headers=headers, json=payload, timeout=15)
-        if resp.status_code == 401 and attempt == 1:
-            frappe.cache().delete_value(CACHE_KEY)
-            continue
-        resp.raise_for_status()
-        return
+        try:
+            headers = {"Authorization": f"Bearer {get_access_token(force_login=(attempt == 2))}"}
+            resp = _session.patch(f"{base_url}{path}", headers=headers, json=payload, timeout=20)
+            if resp.status_code == 401 and attempt == 1:
+                frappe.cache().delete_value(CACHE_KEY)
+                continue
+            resp.raise_for_status()
+            return
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401 and attempt == 1:
+                frappe.cache().delete_value(CACHE_KEY)
+                continue
+            raise
+
 
 def normalize_queue_status(value):
     """True = داخل الطابور، False = خارج، None = غير معروف."""
@@ -97,7 +170,11 @@ def get_fresh_queue_status(extension, current_qs, retries=3, delay=2):
 
 def get_busy_extensions():
     """Returns the set of extension numbers currently on a live call."""
-    calls = xapi_get("/xapi/v1/ActiveCalls").get("value", [])
+    try:
+        calls = xapi_get("/xapi/v1/ActiveCalls").get("value", [])
+    except Exception as e:
+        frappe.log_error(f"Error fetching active calls: {e}", "CX3 Sync")
+        return set()
 
     busy = set()
     for call in calls:
@@ -121,6 +198,7 @@ def get_queue_members():
     except Exception as e:
         frappe.log_error(f"Error fetching queue members: {e}", "CX3 Sync")
     return members
+
 
 def sync_extension_status():
     users = xapi_get(
@@ -169,8 +247,6 @@ def sync_extension_status():
                 doc.extension = extension
                 old_profile = None
 
-            # الحالة الشخصية تغيّرت: أعد قراءة حالة الطابور لأن 3CX
-            # قد لا يكون قد حدّث QueueStatus في الاستجابة القديمة بعد
             if (
                 old_profile
                 and old_profile != profile_name
@@ -193,7 +269,6 @@ def sync_extension_status():
 
         except frappe.QueryDeadlockError:
             frappe.db.rollback(save_point="cx3_ext")
-            # إعادة محاولة خفيفة في حال التعارض مع Scheduler
             frappe.db.set_value(
                 "CX3 Extension Status",
                 extension,
@@ -223,14 +298,12 @@ def on_extension_status_update(doc, method=None):
     profile_changed = (not old_doc) or old_profile != doc.current_profile
     queue_changed = (not old_doc) or old_queue_status != doc.queue_status
 
-    # لا شيء تغيّر
     if not profile_changed and not queue_changed:
         return
 
     now = doc.flags.get("status_time") or now_datetime()
     _auto_queue_sync(doc, profile_changed, old_profile)
 
-    # 1. سجل الحالة الشخصية (كما كان)
     active_logs = frappe.get_all(
         "CX3 Status Log",
         filters={"extension": doc.extension, "is_active": 1},
@@ -252,9 +325,9 @@ def on_extension_status_update(doc, method=None):
             new_log.is_active = 1
             new_log.save(ignore_permissions=True)
 
-    # 2. سجل الطابور (جديد، مستقل)
     if queue_changed:
         _roll_queue_log(doc, now)
+
 
 def get_user_id_by_extension(extension):
     data = xapi_get(
@@ -265,8 +338,7 @@ def get_user_id_by_extension(extension):
 
 
 def _auto_queue_sync(doc, profile_changed, old_profile):
-    """أي حالة -> Off Duty: خروج من الطابور. Off Duty -> Available: دخول للطابور."""
-    if not profile_changed or doc.queue_status is None:  # None = ليس عضوًا في طابور
+    if not profile_changed or doc.queue_status is None:
         return
 
     target = None
@@ -294,9 +366,8 @@ def _auto_queue_sync(doc, profile_changed, old_profile):
             "CX3 Auto Queue Login",
         )
 
+
 def verify_queue_status(extension, expected, retries=15, delay=2):
-    """بعد أمر الدخول/الخروج التلقائي: تأكيد أن 3CX نفّذه
-    وتحديث المستند فوراً بدل انتظار المزامنة التالية."""
     for _ in range(retries):
         try:
             data = xapi_get("/xapi/v1/Users", params={
@@ -317,8 +388,8 @@ def verify_queue_status(extension, expected, retries=15, delay=2):
             return
         time.sleep(delay)
 
+
 def _close_logs(doctype, extension, now):
-    """يغلق كل السجلات النشطة لهذا الـ extension."""
     for name in frappe.get_all(doctype, filters={"extension": extension, "is_active": 1}, pluck="name"):
         log = frappe.get_doc(doctype, name)
         log.to_time = now
@@ -329,10 +400,9 @@ def _close_logs(doctype, extension, now):
 
 
 def _roll_queue_log(doc, now):
-    """يغلق سجل الطابور الحالي ويفتح سجلاً جديداً بالحالة الجديدة."""
     _close_logs("CX3 Queue Log", doc.extension, now)
 
-    if not doc.queue_status:  # خارج أي طابور: لا نفتح سجلاً جديداً
+    if not doc.queue_status:
         return
 
     new_log = frappe.new_doc("CX3 Queue Log")
@@ -345,8 +415,10 @@ def _roll_queue_log(doc, now):
     new_log.is_active = 1
     new_log.save(ignore_permissions=True)
 
+
 OFF_DUTY_RAW = {"Custom 2", "Offline Work"}
 TARGET_RAW = "Custom 2"
+
 
 def _apply_off_duty_locally(number, cutoff, queue_logged_out):
     if not frappe.db.exists("CX3 Extension Status", number):
@@ -355,12 +427,12 @@ def _apply_off_duty_locally(number, cutoff, queue_logged_out):
     doc.current_profile = "Off Duty"
     if queue_logged_out and doc.queue_status is not None:
         doc.queue_status = "Logged Out"
-    doc.flags.status_time = cutoff   # يُستخدم كوقت البداية في السجلات
+    doc.flags.status_time = cutoff
     doc.save(ignore_permissions=True)
+
 
 def set_all_off_duty(dry_run=False):
     cutoff = now_datetime().replace(hour=23, minute=59, second=59, microsecond=0)
-    """12 ليلًا: كل الموظفين Off Duty وخارج الطابور. لا شيء يعيدهم تلقائيًا."""
     users = xapi_get(
         "/xapi/v1/Users",
         params={"$select": "Id,Number,CurrentProfileName,QueueStatus,Enabled,AIAgent"},
@@ -379,7 +451,6 @@ def set_all_off_duty(dry_run=False):
         if u.get("CurrentProfileName") not in OFF_DUTY_RAW:
             payload["CurrentProfileName"] = TARGET_RAW
 
-        # نخرجه من الطابور فقط إذا كان عضوًا في طابور وما زال LoggedIn
         if number in queue_members and normalize_queue_status(u.get("QueueStatus")) is True:
             payload["QueueStatus"] = "LoggedOut"
 
